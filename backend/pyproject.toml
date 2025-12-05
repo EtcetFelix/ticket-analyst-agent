@@ -15,7 +15,8 @@ dependencies = [
     "sqlalchemy (>=2.0.44,<3.0.0)",
     "pydantic-settings (>=2.12.0,<3.0.0)",
     "langgraph (>=1.0.4,<2.0.0)",
-    "langchain-core (>=1.1.1,<2.0.0)"
+    "langchain-core (>=1.1.1,<2.0.0)",
+    "openai (>=2.9.0,<3.0.0)"
 ]
 
 

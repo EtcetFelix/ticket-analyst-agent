@@ -1,7 +1,7 @@
-# backend/app/agent.py
-from typing import TypedDict, List, Optional, Annotated
+from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
-import operator
+from openai import OpenAI
+from pydantic import BaseModel
 
 from app.models import Ticket, TicketAnalysisCreate
 from app.db import (
@@ -10,6 +10,25 @@ from app.db import (
     create_analysis_run,
     bulk_insert_ticket_analysis,
 )
+from app.config import settings
+
+
+# ============================================================================
+# OpenAI Client Setup
+# ============================================================================
+
+client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+# ============================================================================
+# Structured Output Schemas for LLM
+# ============================================================================
+
+class TicketClassification(BaseModel):
+    """Structured output from LLM for a single ticket"""
+    category: str  # billing, bug, feature_request, or general
+    priority: str  # high, medium, or low
+    reasoning: str  # Brief explanation of the classification
 
 
 # ============================================================================
@@ -18,11 +37,11 @@ from app.db import (
 
 class AgentState(TypedDict):
     """State passed between nodes in the analysis graph"""
-    ticket_ids: Optional[List[int]]  # If None, analyze all tickets
-    tickets: List[Ticket]  # Fetched tickets to analyze
-    run_id: Optional[int]  # Created analysis run ID
-    summary: str  # Overall summary of the analysis
-    analyses: List[TicketAnalysisCreate]  # Per-ticket analysis results
+    ticket_ids: Optional[List[int]]
+    tickets: List[Ticket]
+    run_id: Optional[int]
+    summary: str
+    analyses: List[TicketAnalysisCreate]
 
 
 # ============================================================================
@@ -47,82 +66,107 @@ def fetch_tickets_node(state: AgentState) -> AgentState:
     }
 
 
+def classify_ticket_with_llm(ticket: Ticket) -> TicketClassification:
+    """
+    Use OpenAI to classify a single ticket with structured outputs.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",  # Fast and cheap for this task
+        messages=[
+            {
+                "role": "system",
+                "content": """You are a support ticket classifier. Analyze the ticket and provide:
+1. Category: Choose one of: billing, bug, feature_request, general
+2. Priority: Choose one of: high, medium, low
+3. Reasoning: Brief explanation (1-2 sentences)
+
+Guidelines:
+- billing: payment, subscription, refund issues
+- bug: errors, crashes, things not working
+- feature_request: new features, enhancements
+- general: everything else
+
+- high: urgent issues affecting production/revenue
+- medium: important but not urgent
+- low: minor issues, nice-to-haves"""
+            },
+            {
+                "role": "user",
+                "content": f"Title: {ticket.title}\n\nDescription: {ticket.description}"
+            }
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ticket_classification",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": ["billing", "bug", "feature_request", "general"]
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"]
+                        },
+                        "reasoning": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["category", "priority", "reasoning"],
+                    "additionalProperties": False
+                }
+            }
+        },
+        temperature=0.3,
+    )
+    
+    # Parse the structured response
+    import json
+    result = response.choices[0].message.content
+    classification_dict = json.loads(result)
+    return TicketClassification(**classification_dict)
+
+
 def analyze_tickets_node(state: AgentState) -> AgentState:
     """
-    Node 2: Analyze each ticket using keyword-based classification.
-    
-    NOTE: This uses simple keyword matching instead of a real LLM to avoid
-    needing API keys for the take-home. In production, this would call
-    Claude/GPT with a structured prompt.
-    
-    Category logic:
-    - billing: "billing", "payment", "card", "charge", "invoice"
-    - bug: "bug", "crash", "error", "broken", "not working"
-    - feature_request: "feature", "request", "add", "want", "could you"
-    
-    Priority logic:
-    - high: "urgent", "asap", "critical", "immediately", "production"
-    - medium: everything else (default)
-    - low: "minor", "eventually", "nice to have"
+    Node 2: Analyze each ticket using OpenAI LLM with structured outputs.
     """
     tickets = state["tickets"]
     analyses = []
     
-    # Category and priority keywords
-    category_keywords = {
-        "billing": ["billing", "payment", "card", "charge", "invoice", "refund", "subscription"],
-        "bug": ["bug", "crash", "error", "broken", "not working", "fails", "doesn't work"],
-        "feature_request": ["feature", "request", "add", "want", "could you", "suggestion", "enhance"],
-    }
-    
-    priority_keywords = {
-        "high": ["urgent", "asap", "critical", "immediately", "production", "down", "outage"],
-        "low": ["minor", "eventually", "nice to have", "sometime", "when possible"],
-    }
-    
     for ticket in tickets:
-        # Combine title and description for analysis
-        text = f"{ticket.title} {ticket.description}".lower()
-        
-        # Determine category
-        category = "general"  # default
-        for cat, keywords in category_keywords.items():
-            if any(keyword in text for keyword in keywords):
-                category = cat
-                break
-        
-        # Determine priority
-        priority = "medium"  # default
-        for pri, keywords in priority_keywords.items():
-            if any(keyword in text for keyword in keywords):
-                priority = pri
-                break
-        
-        # Generate notes explaining the classification
-        notes = f"Classified based on keywords. Category: {category}, Priority: {priority}."
+        # Classify using LLM
+        classification = classify_ticket_with_llm(ticket)
         
         analyses.append(
             TicketAnalysisCreate(
                 analysis_run_id=0,  # Will be updated in save_results_node
                 ticket_id=ticket.id,
-                category=category,
-                priority=priority,
-                notes=notes,
+                category=classification.category,
+                priority=classification.priority,
+                notes=classification.reasoning,
             )
         )
     
     # Generate overall summary
     total = len(tickets)
     high_priority = sum(1 for a in analyses if a.priority == "high")
+    medium_priority = sum(1 for a in analyses if a.priority == "medium")
+    low_priority = sum(1 for a in analyses if a.priority == "low")
+    
     categories = {}
     for a in analyses:
         categories[a.category] = categories.get(a.category, 0) + 1
     
-    category_summary = ", ".join(f"{count} {cat}" for cat, count in categories.items())
+    category_summary = ", ".join(f"{count} {cat}" for cat, count in sorted(categories.items()))
+    
     summary = (
         f"Analyzed {total} ticket(s). "
-        f"Found {high_priority} high-priority issue(s). "
-        f"Breakdown: {category_summary}."
+        f"Priority breakdown: {high_priority} high, {medium_priority} medium, {low_priority} low. "
+        f"Categories: {category_summary}."
     )
     
     return {
