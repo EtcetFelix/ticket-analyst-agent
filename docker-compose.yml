@@ -30,6 +30,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend/app:/app/app  # Hot reload for development
+      - ./backend/tests:/app/tests
 
 volumes:
   postgres_data:
