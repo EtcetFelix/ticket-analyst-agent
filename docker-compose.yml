@@ -32,5 +32,12 @@ services:
       - ./backend/app:/app/app  # Hot reload for development
       - ./backend/tests:/app/tests
 
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
 volumes:
   postgres_data:
